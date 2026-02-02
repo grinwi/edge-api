@@ -4,7 +4,7 @@
  * Endpoints
  * - GET /status                 -> health check JSON
  * - GET /data                   -> fetches external API data and caches for 30 seconds
- * - GET /weather?lat=..&lon=..  -> current weather + precipitation for next 3 hours
+ * - GET /weather?lat=..&lon=..  -> current weather + precipitation for next 3 hours.
  */
 
 export default {
@@ -21,6 +21,7 @@ export default {
         }
       });
     }
+
 
     if (url.pathname === '/data') {
       // Cache key based on request URL; only GET is cacheable
