@@ -60,7 +60,7 @@ export default {
             const upstream = await fetch(p.url, {
               signal: controller.signal,
               headers: {
-                'User-Agent': 'edge-api/1.0 (+https://workers.dev)',
+                'User-Agent': 'edge-api/1.0 (+https://edge-api.grinwi.workers.dev)',
                 'Accept': 'application/json'
               },
               cf: {
@@ -111,7 +111,7 @@ export default {
       }
     }
 
-    // Weather endpoint: current conditions and next 3 hours precipitation via Open-Meteo
+    // Weather endpoint: current conditions and next 3 hours precipitation with multi-provider fallback
     if (url.pathname === '/weather') {
       const latStr = url.searchParams.get('lat');
       const lonStr = url.searchParams.get('lon');
@@ -142,96 +142,171 @@ export default {
         return cached;
       }
 
-      // Open-Meteo free API, no key required
-      const upstreamUrl = new URL('https://api.open-meteo.com/v1/forecast');
-      upstreamUrl.searchParams.set('latitude', lat.toString());
-      upstreamUrl.searchParams.set('longitude', lon.toString());
-      // Request current metrics, and hourly precipitation to extract next 3 hours
-      upstreamUrl.searchParams.set('current', 'temperature_2m,precipitation,weather_code,wind_speed_10m');
-      upstreamUrl.searchParams.set('hourly', 'precipitation,precipitation_probability');
-      upstreamUrl.searchParams.set('timezone', 'UTC');
-
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 6000);
 
-      try {
-        const res = await fetch(upstreamUrl.toString(), {
-          signal: controller.signal,
-          headers: { 'Accept': 'application/json' },
-          cf: { cacheTtl: 120, cacheEverything: true }
-        });
-        if (!res.ok) {
-          return new Response(JSON.stringify({ error: 'Upstream API error', status: res.status }), {
-            status: 502,
-            headers: { 'Content-Type': 'application/json' }
-          });
-        }
+      type WeatherPayload = {
+        lat: number;
+        lon: number;
+        current: {
+          temperature_c: number | null;
+          precipitation_mm: number | null;
+          weather_code: string | number | null;
+          wind_speed_10m: number | null;
+          time: string | null;
+        } | null;
+        next3h: Array<{ time: string; precipitation_mm: number | null; precipitation_probability: number | null }>;
+      };
 
-        const data: any = await res.json();
+      // Providers: try Open-Meteo first, then MET Norway (api.met.no)
+      const providers: Array<{
+        name: string;
+        url: string;
+        parse: (data: any) => WeatherPayload;
+      }> = [
+        {
+          name: 'open-meteo',
+          url: (() => {
+            const u = new URL('https://api.open-meteo.com/v1/forecast');
+            u.searchParams.set('latitude', lat.toString());
+            u.searchParams.set('longitude', lon.toString());
+            u.searchParams.set('current', 'temperature_2m,precipitation,weather_code,wind_speed_10m');
+            u.searchParams.set('hourly', 'precipitation,precipitation_probability');
+            u.searchParams.set('timezone', 'UTC');
+            return u.toString();
+          })(),
+          parse: (data: any) => {
+            const current = (() => {
+              if (data.current) {
+                return {
+                  temperature_c: data.current.temperature_2m ?? null,
+                  precipitation_mm: data.current.precipitation ?? null,
+                  weather_code: data.current.weather_code ?? null,
+                  wind_speed_10m: data.current.wind_speed_10m ?? null,
+                  time: data.current.time ?? null
+                };
+              }
+              if (data.current_weather) {
+                return {
+                  temperature_c: data.current_weather.temperature ?? null,
+                  precipitation_mm: null,
+                  weather_code: data.current_weather.weathercode ?? null,
+                  wind_speed_10m: data.current_weather.windspeed ?? null,
+                  time: data.current_weather.time ?? null
+                };
+              }
+              return null;
+            })();
 
-        // Extract current weather (prefer new `current` fields; fallback to `current_weather` if present)
-        const current = (() => {
-          if (data.current) {
-            return {
-              temperature_c: data.current.temperature_2m ?? null,
-              precipitation_mm: data.current.precipitation ?? null,
-              weather_code: data.current.weather_code ?? null,
-              wind_speed_10m: data.current.wind_speed_10m ?? null,
-              time: data.current.time ?? null
-            };
-          }
-          if (data.current_weather) {
-            return {
-              temperature_c: data.current_weather.temperature ?? null,
-              precipitation_mm: null,
-              weather_code: data.current_weather.weathercode ?? null,
-              wind_speed_10m: data.current_weather.windspeed ?? null,
-              time: data.current_weather.time ?? null
-            };
-          }
-          return null;
-        })();
-
-        // Build next 3 hours precipitation timeline from hourly arrays
-        let next3h: Array<{ time: string; precipitation_mm: number | null; precipitation_probability: number | null }> = [];
-        if (data.hourly && Array.isArray(data.hourly.time)) {
-          const times: string[] = data.hourly.time;
-          const precip: Array<number | null> = data.hourly.precipitation || [];
-          const precipProb: Array<number | null> = data.hourly.precipitation_probability || [];
-
-          const nowIso = new Date().toISOString();
-          for (let i = 0; i < times.length; i++) {
-            if (times[i] >= nowIso) {
-              next3h.push({
-                time: times[i],
-                precipitation_mm: precip[i] ?? null,
-                precipitation_probability: precipProb[i] ?? null
-              });
-              if (next3h.length >= 3) break;
+            let next3h: Array<{ time: string; precipitation_mm: number | null; precipitation_probability: number | null }> = [];
+            if (data.hourly && Array.isArray(data.hourly.time)) {
+              const times: string[] = data.hourly.time;
+              const precip: Array<number | null> = data.hourly.precipitation || [];
+              const precipProb: Array<number | null> = data.hourly.precipitation_probability || [];
+              const nowIso = new Date().toISOString();
+              for (let i = 0; i < times.length; i++) {
+                if (times[i] >= nowIso) {
+                  next3h.push({
+                    time: times[i],
+                    precipitation_mm: precip[i] ?? null,
+                    precipitation_probability: precipProb[i] ?? null
+                  });
+                  if (next3h.length >= 3) break;
+                }
+              }
             }
+
+            return { lat, lon, current, next3h };
+          }
+        },
+        {
+          name: 'met-no',
+          url: (() => {
+            const u = new URL('https://api.met.no/weatherapi/locationforecast/2.0/compact');
+            u.searchParams.set('lat', lat.toString());
+            u.searchParams.set('lon', lon.toString());
+            return u.toString();
+          })(),
+          parse: (data: any) => {
+            const ts = data?.properties?.timeseries;
+            let current: WeatherPayload['current'] = null;
+            let next3h: WeatherPayload['next3h'] = [];
+            if (Array.isArray(ts) && ts.length > 0) {
+              const first = ts[0];
+              const details = first?.data?.instant?.details || {};
+              const n1 = first?.data?.next_1_hours?.details || {};
+              current = {
+                temperature_c: details.air_temperature ?? null,
+                precipitation_mm: n1.precipitation_amount ?? null,
+                weather_code: first?.data?.next_1_hours?.summary?.symbol_code ?? null,
+                wind_speed_10m: details.wind_speed ?? null,
+                time: first?.time ?? null
+              };
+
+              const nowIso = new Date().toISOString();
+              for (const entry of ts) {
+                const t = entry?.time as string;
+                if (!t || t < nowIso) continue;
+                const d = entry?.data?.instant?.details || {};
+                const n1h = entry?.data?.next_1_hours?.details || {};
+                next3h.push({
+                  time: t,
+                  precipitation_mm: n1h.precipitation_amount ?? null,
+                  precipitation_probability: null
+                });
+                if (next3h.length >= 3) break;
+              }
+            }
+            return { lat, lon, current, next3h };
+          }
+        }
+      ];
+
+      try {
+        for (const p of providers) {
+          try {
+            const res = await fetch(p.url, {
+              signal: controller.signal,
+              headers: {
+                'Accept': 'application/json',
+                // MET Norway requires an identifying UA; good practice for any public API
+                'User-Agent': 'edge-api/1.0 (+https://edge-api.grinwi.workers.dev)'
+              },
+              cf: { cacheTtl: 120, cacheEverything: true }
+            });
+
+            if (!res.ok) {
+              if (res.status === 403 || res.status === 429 || res.status >= 500) {
+                // Try next provider on common upstream blocks/limits/server errors
+                continue;
+              }
+              return new Response(JSON.stringify({ error: 'Upstream API error', status: res.status }), {
+                status: 502,
+                headers: { 'Content-Type': 'application/json' }
+              });
+            }
+
+            const raw = await res.json();
+            const payload = p.parse(raw);
+
+            const response = new Response(JSON.stringify(payload), {
+              headers: {
+                'Content-Type': 'application/json',
+                'Cache-Control': 'public, max-age=120'
+              }
+            });
+            // Populate edge cache asynchronously
+            ctx.waitUntil(cache.put(cacheKey, response.clone()));
+            return response;
+          } catch (e) {
+            // network error/timeout, attempt next provider
+            continue;
           }
         }
 
-        const payload = {
-          lat,
-          lon,
-          current,
-          next3h
-        };
-
-        const response = new Response(JSON.stringify(payload), {
-          headers: {
-            'Content-Type': 'application/json',
-            'Cache-Control': 'public, max-age=120'
-          }
-        });
-        // Populate edge cache asynchronously
-        ctx.waitUntil(cache.put(cacheKey, response.clone()));
-        return response;
-      } catch (err) {
-        const status = (err as any)?.name === 'AbortError' ? 504 : 500;
-        return new Response(JSON.stringify({ error: 'Weather fetch failed' }), {
-          status,
+        // If all providers failed with retryable conditions
+        return new Response(JSON.stringify({ error: 'All weather providers failed' }), {
+          status: 504,
           headers: { 'Content-Type': 'application/json' }
         });
       } finally {
