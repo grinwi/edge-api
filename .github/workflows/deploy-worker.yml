@@ -12,6 +12,7 @@ jobs:
         with:
           node-version: '20'
       - run: npm ci
-      - run: npm run deploy
+      - run: npx --yes wrangler@4 deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
