@@ -1,320 +1,95 @@
 /**
- * Edge API: Global JSON API with Edge Caching
+ * Edge API: Modular Router (clean, maintainable)
  *
- * Endpoints
- * - GET /status                 -> health check JSON
- * - GET /data                   -> fetches external API data and caches for 30 seconds
- * - GET /weather?lat=..&lon=..  -> current weather + precipitation for next 3 hours.
+ * Namespaces
+ * - Weather:    GET /weather (short), GET /weather/forecast (daily up to 16 days, by city or coords)
+ * - Exchange:   GET /exchange (latest FX rates)
+ * - Webcam:     GET /webcam/stream, POST /webcam/ptz (bridge-backed)
+ * - Camera:     GET /camera/stream, POST /camera/ptz (bridge-backed)
+ * - Video:      GET /video (generic byte-range proxy)
+ * - Utilities:  GET /status, GET /data (sample)
+ *
+ * Design
+ * - Single place to declare routes (ROUTES map) -> improves discoverability.
+ * - Each feature lives in src/routes/* with focused handlers and comments.
+ * - Keep /exchange inline for now (simple wrapper); easy to move later.
  */
+
+import { handleStatus } from './routes/status';
+import { handleData } from './routes/data';
+import { handleWeatherNow, handleWeatherForecast } from './routes/weather';
+import { handleVideo } from './routes/video';
+import { handleCameraStream, handleCameraPtz } from './routes/camera';
+import { handleWebcamStream, handleWebcamPtz } from './routes/webcam';
+
+// Route path constants to avoid string literal drift across files
+const PATH = {
+  STATUS: '/status',
+  DATA: '/data',
+  WEATHER_NOW: '/weather',
+  WEATHER_FORECAST: '/weather/forecast',
+  EXCHANGE: '/exchange',
+  VIDEO: '/video',
+  CAMERA_STREAM: '/camera/stream',
+  CAMERA_PTZ: '/camera/ptz',
+  WEBCAM_STREAM: '/webcam/stream',
+  WEBCAM_PTZ: '/webcam/ptz'
+} as const;
+
+type Handler = (request: Request, env: Env, ctx: ExecutionContext, url: URL) => Promise<Response>;
+
+/**
+ * Central route registry. Handlers are small delegators to feature modules.
+ * Method checks are left to the handlers (so OPTIONS/POST logic stays local to a module).
+ */
+const ROUTES: Record<string, Handler> = {
+  [PATH.STATUS]: (req) => handleStatus(req),
+  [PATH.DATA]: (req, env, ctx, url) => handleData(req, env, ctx, url),
+  [PATH.WEATHER_NOW]: (req, env, ctx, url) => handleWeatherNow(req, env, ctx, url),
+  [PATH.WEATHER_FORECAST]: (req, env, ctx, url) => handleWeatherForecast(req, env, ctx, url),
+  [PATH.EXCHANGE]: (req, env, ctx, url) => handleExchange(req, env, ctx, url),
+  [PATH.VIDEO]: (req, env, ctx, url) => handleVideo(req, env, ctx, url),
+  [PATH.CAMERA_STREAM]: (req, env, ctx, url) => handleCameraStream(req, env, ctx, url),
+  [PATH.CAMERA_PTZ]: (req, env, ctx) => handleCameraPtz(req, env, ctx),
+  [PATH.WEBCAM_STREAM]: (req, env, ctx, url) => handleWebcamStream(req, env, ctx, url),
+  [PATH.WEBCAM_PTZ]: (req, env, ctx, url) => handleWebcamPtz(req, env, ctx, url)
+};
 
 export default {
   async fetch(request, env, ctx): Promise<Response> {
     const url = new URL(request.url);
-
-    if (url.pathname === '/status') {
-      const body = JSON.stringify({ status: 'ok', timestamp: Date.now() });
-      return new Response(body, {
-        headers: {
-          'Content-Type': 'application/json',
-          // Small cache to avoid stampedes for status, adjust as desired
-          'Cache-Control': 'public, max-age=5'
-        }
-      });
-    }
-
-
-    if (url.pathname === '/data') {
-      // Cache key based on request URL; only GET is cacheable
-      const cache = caches.default;
-      const cacheKey = new Request(url.toString());
-
-      // Fast path: serve from cache if present
-      const cached = await cache.match(cacheKey);
-      if (cached) {
-        return cached;
-      }
-
-      // Primary provider: CoinGecko (may return 403/429 under some networks)
-      // Fallback provider: Chuck Norris jokes (no auth)
-      const providers = [
-        {
-          name: 'coingecko',
-          url: 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd',
-          transform: (d: any) => d
-        },
-        {
-          name: 'chucknorris',
-          url: 'https://api.chucknorris.io/jokes/random',
-          transform: (d: any) => ({ joke: d.value })
-        }
-      ] as const;
-
-      // Add a timeout to handle flaky networks during local dev or proxy hiccups
-      const controller = new AbortController();
-      const timeoutMs = 4500;
-      const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-      try {
-        for (const p of providers) {
-          try {
-            // Use Cloudflare cache override for upstream fetch to respect a 30s TTL
-            const upstream = await fetch(p.url, {
-              signal: controller.signal,
-              headers: {
-                'User-Agent': 'edge-api/1.0 (+https://edge-api.grinwi.workers.dev)',
-                'Accept': 'application/json'
-              },
-              cf: {
-                cacheTtl: 30,
-                cacheEverything: true
-              }
-            });
-
-            if (!upstream.ok) {
-              // Try next provider on common upstream blocks or server errors
-              if (upstream.status === 403 || upstream.status === 429 || upstream.status >= 500) {
-                continue;
-              }
-              // Return error for other non-OK statuses
-              return new Response(
-                JSON.stringify({ error: 'Upstream API error', status: upstream.status }),
-                { status: 502, headers: { 'Content-Type': 'application/json' } }
-              );
-            }
-
-            const data = await upstream.json();
-            const payload = p.transform(data);
-            const response = new Response(JSON.stringify({ provider: p.name, payload }), {
-              headers: {
-                'Content-Type': 'application/json',
-                // Advertise caching to clients and to Cloudflare edge
-                'Cache-Control': 'public, max-age=30'
-              }
-            });
-
-            // Populate edge cache asynchronously
-            ctx.waitUntil(cache.put(cacheKey, response.clone()));
-            return response;
-          } catch (e) {
-            // On network error or timeout, try next provider
-            // If AbortError, we still attempt next provider in case of transient issues
-            continue;
-          }
-        }
-
-        // If all providers failed
-        return new Response(JSON.stringify({ error: 'All providers failed' }), {
-          status: 504,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      } finally {
-        clearTimeout(timeout);
-      }
-    }
-
-    // Weather endpoint: current conditions and next 3 hours precipitation with multi-provider fallback
-    if (url.pathname === '/weather') {
-      const latStr = url.searchParams.get('lat');
-      const lonStr = url.searchParams.get('lon');
-
-      const badReq = (msg: string) => new Response(JSON.stringify({ error: msg }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' }
-      });
-
-      if (!latStr || !lonStr) {
-        return badReq('Missing required query params: lat and lon');
-      }
-
-      const lat = Number(latStr);
-      const lon = Number(lonStr);
-      if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-        return badReq('lat and lon must be numbers');
-      }
-      if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
-        return badReq('lat must be between -90..90 and lon between -180..180');
-      }
-
-      // Cache by exact URL (includes lat/lon). Keep short for freshness.
-      const cache = caches.default;
-      const cacheKey = new Request(url.toString());
-      const cached = await cache.match(cacheKey);
-      if (cached) {
-        return cached;
-      }
-
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 6000);
-
-      type WeatherPayload = {
-        lat: number;
-        lon: number;
-        current: {
-          temperature_c: number | null;
-          precipitation_mm: number | null;
-          weather_code: string | number | null;
-          wind_speed_10m: number | null;
-          time: string | null;
-        } | null;
-        next3h: Array<{ time: string; precipitation_mm: number | null; precipitation_probability: number | null }>;
-      };
-
-      // Providers: try Open-Meteo first, then MET Norway (api.met.no)
-      const providers: Array<{
-        name: string;
-        url: string;
-        parse: (data: any) => WeatherPayload;
-      }> = [
-        {
-          name: 'open-meteo',
-          url: (() => {
-            const u = new URL('https://api.open-meteo.com/v1/forecast');
-            u.searchParams.set('latitude', lat.toString());
-            u.searchParams.set('longitude', lon.toString());
-            u.searchParams.set('current', 'temperature_2m,precipitation,weather_code,wind_speed_10m');
-            u.searchParams.set('hourly', 'precipitation,precipitation_probability');
-            u.searchParams.set('timezone', 'UTC');
-            return u.toString();
-          })(),
-          parse: (data: any) => {
-            const current = (() => {
-              if (data.current) {
-                return {
-                  temperature_c: data.current.temperature_2m ?? null,
-                  precipitation_mm: data.current.precipitation ?? null,
-                  weather_code: data.current.weather_code ?? null,
-                  wind_speed_10m: data.current.wind_speed_10m ?? null,
-                  time: data.current.time ?? null
-                };
-              }
-              if (data.current_weather) {
-                return {
-                  temperature_c: data.current_weather.temperature ?? null,
-                  precipitation_mm: null,
-                  weather_code: data.current_weather.weathercode ?? null,
-                  wind_speed_10m: data.current_weather.windspeed ?? null,
-                  time: data.current_weather.time ?? null
-                };
-              }
-              return null;
-            })();
-
-            let next3h: Array<{ time: string; precipitation_mm: number | null; precipitation_probability: number | null }> = [];
-            if (data.hourly && Array.isArray(data.hourly.time)) {
-              const times: string[] = data.hourly.time;
-              const precip: Array<number | null> = data.hourly.precipitation || [];
-              const precipProb: Array<number | null> = data.hourly.precipitation_probability || [];
-              const nowIso = new Date().toISOString();
-              for (let i = 0; i < times.length; i++) {
-                if (times[i] >= nowIso) {
-                  next3h.push({
-                    time: times[i],
-                    precipitation_mm: precip[i] ?? null,
-                    precipitation_probability: precipProb[i] ?? null
-                  });
-                  if (next3h.length >= 3) break;
-                }
-              }
-            }
-
-            return { lat, lon, current, next3h };
-          }
-        },
-        {
-          name: 'met-no',
-          url: (() => {
-            const u = new URL('https://api.met.no/weatherapi/locationforecast/2.0/compact');
-            u.searchParams.set('lat', lat.toString());
-            u.searchParams.set('lon', lon.toString());
-            return u.toString();
-          })(),
-          parse: (data: any) => {
-            const ts = data?.properties?.timeseries;
-            let current: WeatherPayload['current'] = null;
-            let next3h: WeatherPayload['next3h'] = [];
-            if (Array.isArray(ts) && ts.length > 0) {
-              const first = ts[0];
-              const details = first?.data?.instant?.details || {};
-              const n1 = first?.data?.next_1_hours?.details || {};
-              current = {
-                temperature_c: details.air_temperature ?? null,
-                precipitation_mm: n1.precipitation_amount ?? null,
-                weather_code: first?.data?.next_1_hours?.summary?.symbol_code ?? null,
-                wind_speed_10m: details.wind_speed ?? null,
-                time: first?.time ?? null
-              };
-
-              const nowIso = new Date().toISOString();
-              for (const entry of ts) {
-                const t = entry?.time as string;
-                if (!t || t < nowIso) continue;
-                const d = entry?.data?.instant?.details || {};
-                const n1h = entry?.data?.next_1_hours?.details || {};
-                next3h.push({
-                  time: t,
-                  precipitation_mm: n1h.precipitation_amount ?? null,
-                  precipitation_probability: null
-                });
-                if (next3h.length >= 3) break;
-              }
-            }
-            return { lat, lon, current, next3h };
-          }
-        }
-      ];
-
-      try {
-        for (const p of providers) {
-          try {
-            const res = await fetch(p.url, {
-              signal: controller.signal,
-              headers: {
-                'Accept': 'application/json',
-                // MET Norway requires an identifying UA; good practice for any public API
-                'User-Agent': 'edge-api/1.0 (+https://edge-api.grinwi.workers.dev)'
-              },
-              cf: { cacheTtl: 120, cacheEverything: true }
-            });
-
-            if (!res.ok) {
-              if (res.status === 403 || res.status === 429 || res.status >= 500) {
-                // Try next provider on common upstream blocks/limits/server errors
-                continue;
-              }
-              return new Response(JSON.stringify({ error: 'Upstream API error', status: res.status }), {
-                status: 502,
-                headers: { 'Content-Type': 'application/json' }
-              });
-            }
-
-            const raw = await res.json();
-            const payload = p.parse(raw);
-
-            const response = new Response(JSON.stringify(payload), {
-              headers: {
-                'Content-Type': 'application/json',
-                'Cache-Control': 'public, max-age=120'
-              }
-            });
-            // Populate edge cache asynchronously
-            ctx.waitUntil(cache.put(cacheKey, response.clone()));
-            return response;
-          } catch (e) {
-            // network error/timeout, attempt next provider
-            continue;
-          }
-        }
-
-        // If all providers failed with retryable conditions
-        return new Response(JSON.stringify({ error: 'All weather providers failed' }), {
-          status: 504,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      } finally {
-        clearTimeout(timeout);
-      }
-    }
-
-    return new Response('Not Found', { status: 404 });
+    const handler = ROUTES[url.pathname];
+    if (handler) return handler(request, env, ctx, url);
+    return notFound();
   }
 } satisfies ExportedHandler<Env>;
+
+/**
+ * Exchange rates (thin inline wrapper)
+ *
+ * GET /exchange?base=USD&symbols=EUR,CZK
+ * - Uses frankfurter.app latest rates.
+ * - Edge cache for 6 hours.
+ */
+async function handleExchange(_request: Request, _env: Env, _ctx: ExecutionContext, url: URL): Promise<Response> {
+  const base = (url.searchParams.get('base') || 'USD').toUpperCase();
+  const symbols = url.searchParams.get('symbols');
+
+  const u = new URL('https://api.frankfurter.app/latest');
+  u.searchParams.set('from', base);
+  if (symbols) u.searchParams.set('to', symbols);
+
+  const res = await fetch(u.toString(), { headers: { 'Accept': 'application/json' }, cf: { cacheTtl: 21600, cacheEverything: true } });
+  if (!res.ok) return json({ error: 'Upstream exchange failed', status: res.status }, 502);
+  const x = (await res.json()) as { base?: string; date?: string; rates?: Record<string, number> };
+  return json({ base: x.base || base, date: x.date, rates: x.rates || {} }, 200, { 'Cache-Control': 'public, max-age=21600' });
+}
+
+// ---------- Small response helpers (local to router) ----------
+function json(data: unknown, status = 200, headers?: Record<string, string>): Response {
+  const h = new Headers({ 'Content-Type': 'application/json', ...headers });
+  return new Response(JSON.stringify(data), { status, headers: h });
+}
+function notFound(): Response {
+  return new Response('Not Found', { status: 404 });
+}
